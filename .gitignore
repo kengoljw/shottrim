@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 本地日志
+*.log
+shottrim.log
+
+# 其他
+nul
+*.tmp
+*.swp
