@@ -705,21 +705,31 @@ def select_region(mon):
     mw, mh = mon["width"], mon["height"]
     log2(f"select_region 开始: 显示器 {mw}x{mh}")
 
-    # 关键：必须在创建全屏蒙层之前取前台窗口
-    # （创建后前台窗口会变成蒙层自己）
+    # 关键步骤（必须在创建蒙层之前完成，否则会抢焦点）：
+    # 1) 取前台窗口矩形
     fg = get_foreground_window_rect()
     log2(f"前台窗口矩形: {fg}")
+
+    # 2) 预先截取整屏快照 —— 保存网页下拉框/右键菜单/悬停提示等瞬时状态
+    with mss.MSS() as sct:
+        _full = sct.grab({"left": ml, "top": mt, "width": mw, "height": mh})
+        snapshot = Image.frombytes("RGB", (mw, mh), _full.rgb)
+    log2(f"已预先截屏 {mw}x{mh}")
 
     root = tk.Tk()
     root.overrideredirect(True)
     root.attributes("-topmost", True)
-    root.attributes("-alpha", 0.3)
     root.configure(bg="black")
     root.geometry(f"{mw}x{mh}+{ml}+{mt}")
-    root.focus_force()
 
     canvas = tk.Canvas(root, cursor="cross", highlightthickness=0, bg="black")
     canvas.pack(fill="both", expand=True)
+
+    # 把快照画到画布上（作为背景），再叠半透明遮罩
+    from PIL import ImageTk
+    _photo = ImageTk.PhotoImage(snapshot)
+    canvas.create_image(0, 0, image=_photo, anchor="nw")
+    canvas._photo = _photo   # 防止被 GC
 
     state = {"box": None, "win": None, "inset": 0, "hover": None,
              "dragging": False, "drag_start": None, "drag_cur": None}
@@ -744,8 +754,23 @@ def select_region(mon):
                 min(mw, r[2] - ml), min(mh, r[3] - mt))
 
     def redraw():
+        # 保留快照背景，只清除其余元素
         canvas.delete("all")
+        canvas.create_image(0, 0, image=_photo, anchor="nw")
         mx, my = last_cursor["x"], last_cursor["y"]
+
+        # 选框外的压暗遮罩（先画，选框区域留亮）
+        _sel = state["box"]
+        if _sel:
+            x0, y0, x1, y1 = _sel
+            canvas.create_rectangle(0, 0, mw, y0, fill="#000000", stipple="gray50")
+            canvas.create_rectangle(0, y1, mw, mh, fill="#000000", stipple="gray50")
+            canvas.create_rectangle(0, y0, x0, y1, fill="#000000", stipple="gray50")
+            canvas.create_rectangle(x1, y0, mw, y1, fill="#000000", stipple="gray50")
+        else:
+            canvas.create_rectangle(0, 0, mw, mh, fill="#000000", stipple="gray75")
+
+        # 十字准星
         canvas.create_line(mx, 0, mx, mh, fill="#00e0ff", width=1, dash=(4, 4))
         canvas.create_line(0, my, mw, my, fill="#00e0ff", width=1, dash=(4, 4))
         if state["dragging"] and state["drag_start"] and state["drag_cur"]:
@@ -869,8 +894,8 @@ def select_region(mon):
     redraw()
     root.mainloop()
     if result["cancelled"]:
-        return None, 0, "none"
-    return result["rect"], 0, result.get("mode", "window")
+        return None, 0, "none", None
+    return result["rect"], 0, result.get("mode", "window"), snapshot
 
 
 def do_capture(args):
@@ -890,17 +915,19 @@ def do_capture(args):
         rect = (x, y, x + w, y + h)
         margin = args.margin
         sel_mode = "window"
+        snapshot = None
     elif getattr(args, "auto", False):
         mon = mss.MSS().monitors[0]
         rect = (mon["left"], mon["top"],
                 mon["left"] + mon["width"], mon["top"] + mon["height"])
         margin = args.margin
         sel_mode = "window"
+        snapshot = None
     elif getattr(args, "interactive", False) or True:
         # 直接在本进程内跑 tkinter 蒙层（pythonw 下可正常工作）
         # 不再启动子进程，避免启动开销导致慢
         mon = monitor_containing(*cursor_pos())
-        rect, margin, sel_mode = select_region(mon)
+        rect, margin, sel_mode, snapshot = select_region(mon)
         if not rect:
             print("已取消。")
             return None
@@ -910,8 +937,16 @@ def do_capture(args):
         print("选区太小，已取消。")
         return None
 
-    img = mss.MSS().grab({"left": l, "top": t, "width": r - l, "height": b - t})
-    img = Image.frombytes("RGB", (r - l, b - t), img.rgb)
+    # 快照的屏幕原点（用于把屏幕坐标转成快照内坐标）
+    snapshot_origin = (mon["left"], mon["top"]) if snapshot is not None else (0, 0)
+
+    if snapshot is not None:
+        # 使用预先截取的快照：保留网页下拉框等瞬时 UI 状态
+        img = snapshot.crop((l - snapshot_origin[0], t - snapshot_origin[1],
+                             r - snapshot_origin[0], b - snapshot_origin[1]))
+    else:
+        img = mss.MSS().grab({"left": l, "top": t, "width": r - l, "height": b - t})
+        img = Image.frombytes("RGB", (r - l, b - t), img.rgb)
 
     rgb = np.asarray(img)
 
