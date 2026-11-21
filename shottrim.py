@@ -624,9 +624,11 @@ def select_region(mon):
     canvas = tk.Canvas(root, cursor="cross", highlightthickness=0, bg="black")
     canvas.pack(fill="both", expand=True)
 
-    state = {"box": None, "win": None, "inset": 0, "hover": None}
+    state = {"box": None, "win": None, "inset": 0, "hover": None,
+             "dragging": False, "drag_start": None, "drag_cur": None}
     result = {"rect": None, "cancelled": False}
     last_cursor = {"x": mw // 2, "y": mh // 2}
+    DRAG_THRESHOLD = 5   # 位移小于此值视为单击
 
     # 初始选框 = 前台窗口
     if fg:
@@ -649,13 +651,26 @@ def select_region(mon):
         mx, my = last_cursor["x"], last_cursor["y"]
         canvas.create_line(mx, 0, mx, mh, fill="#00e0ff", width=1, dash=(4, 4))
         canvas.create_line(0, my, mw, my, fill="#00e0ff", width=1, dash=(4, 4))
-        if state["box"]:
+        if state["dragging"] and state["drag_start"] and state["drag_cur"]:
+            # 拖拽中：绘制实时矩形
+            sx, sy = state["drag_start"]
+            cx, cy = state["drag_cur"]
+            dx0, dy0 = min(sx, cx), min(sy, cy)
+            dx1, dy1 = max(sx, cx), max(sy, cy)
+            canvas.create_rectangle(dx0, dy0, dx1, dy1, outline="#00e0ff", width=2)
+            canvas.create_rectangle(dx0, dy0, dx1, dy1, outline="#ffffff", width=1)
+            canvas.create_text(dx0 + 6, max(dy0 - 14, 12), anchor="w", fill="#00e0ff",
+                             font=("Consolas", 11), text=f"{dx1-dx0} x {dy1-dy0}")
+            canvas.create_text(mw // 2, mh - 44,
+                             text="松开鼠标以截取此区域  |  Esc取消",
+                             fill="#aaa", font=("Microsoft YaHei", 10))
+        elif state["box"]:
             x0, y0, x1, y1 = state["box"]
             canvas.create_rectangle(x0, y0, x1, y1, outline="#00e0ff", width=3)
             canvas.create_text(x0 + 6, max(y0 - 14, 12), anchor="w", fill="#00e0ff",
                              font=("Consolas", 11), text=f"{x1-x0} x {y1-y0}")
             canvas.create_text(mw // 2, mh - 44,
-                             text=f"单击确认  |  ↑↓ 向内收缩({state['inset']}px)  |  Esc取消",
+                             text=f"单击确认  |  按住拖拽可自选区域  |  ↑↓ 向内收缩({state['inset']}px)  |  Esc取消",
                              fill="#aaa", font=("Microsoft YaHei", 10))
         else:
             # 实时高亮鼠标下最小窗口（微信的悬停预览）
@@ -672,7 +687,65 @@ def select_region(mon):
     def on_motion(e):
         # 只跟踪鼠标位置用于十字准星，选框固定为前台窗口
         last_cursor["x"], last_cursor["y"] = e.x, e.y
+        if state["dragging"]:
+            state["drag_cur"] = (e.x, e.y)
         redraw()
+
+    def on_press(e):
+        """按下鼠标：开始拖拽，记录起点。"""
+        last_cursor["x"], last_cursor["y"] = e.x, e.y
+        state["dragging"] = True
+        state["drag_start"] = (e.x, e.y)
+        state["drag_cur"] = (e.x, e.y)
+        redraw()
+
+    def on_drag(e):
+        """拖动中：实时更新矩形。"""
+        last_cursor["x"], last_cursor["y"] = e.x, e.y
+        if state["dragging"]:
+            state["drag_cur"] = (e.x, e.y)
+            redraw()
+
+    def on_release(e):
+        """松开鼠标：
+        - 位移很小 → 视为单击，走原有窗口吸附逻辑
+        - 位移较大 → 使用拖拽的矩形
+        """
+        cx, cy = e.x, e.y
+        last_cursor["x"], last_cursor["y"] = cx, cy
+        was_dragging = state["dragging"]
+        start = state["drag_start"]
+        state["dragging"] = False
+        state["drag_start"] = None
+        state["drag_cur"] = None
+
+        if was_dragging and start:
+            sx, sy = start
+            moved = max(abs(cx - sx), abs(cy - sy))
+            if moved >= DRAG_THRESHOLD:
+                # 拖拽模式：用拖拽矩形
+                dx0, dy0 = min(sx, cx), min(sy, cy)
+                dx1, dy1 = max(sx, cx), max(sy, cy)
+                if dx1 - dx0 >= 4 and dy1 - dy0 >= 4:
+                    sl, st = to_screen(dx0, dy0)
+                    er, eb = to_screen(dx1, dy1)
+                    result["rect"] = (sl, st, er, eb)
+                    result["mode"] = "drag"
+                    log2(f"拖拽选区: ({dx0},{dy0})-({dx1},{dy1})")
+                    root.destroy()
+                else:
+                    redraw()
+                return
+
+        # 单击模式：沿用原有逻辑（确认当前窗口框）
+        log2(f"单击 at ({cx+ml},{cy+mt}) 当前box={state['box']}")
+        if state["box"]:
+            x0, y0, x1, y1 = state["box"]
+            sl, st = to_screen(x0, y0)
+            er, eb = to_screen(x1, y1)
+            result["rect"] = (sl, st, er, eb)
+            result["mode"] = "window"
+            root.destroy()
 
     def apply_inset(delta):
         """↑↓ 向内收缩/扩展选框（锁定后微调）。"""
@@ -687,20 +760,9 @@ def select_region(mon):
         else:
             state["inset"] = max(0, state["inset"] - delta)
         redraw()
-    def on_click(e):
-        cx, cy = e.x, e.y
-        last_cursor["x"], last_cursor["y"] = cx, cy
-        log2(f"单击 at ({cx+ml},{cy+mt}) 当前box={state['box']}")
-        if not state["box"]:
-            log2("当前没有选框，忽略")
-        if state["box"]:
-            x0, y0, x1, y1 = state["box"]
-            sl, st = to_screen(x0, y0)
-            er, eb = to_screen(x1, y1)
-            result["rect"] = (sl, st, er, eb)
-            root.destroy()
-
-    canvas.bind("<ButtonPress-1>", on_click)
+    canvas.bind("<ButtonPress-1>", on_press)
+    canvas.bind("<B1-Motion>", on_drag)
+    canvas.bind("<ButtonRelease-1>", on_release)
     canvas.bind("<Double-Button-1>", lambda e: None)
     canvas.bind("<Motion>", on_motion)
     root.bind("<Escape>", lambda e: (result.update(cancelled=True), root.destroy()))
@@ -710,8 +772,8 @@ def select_region(mon):
     redraw()
     root.mainloop()
     if result["cancelled"]:
-        return None, 0
-    return result["rect"], 0
+        return None, 0, "none"
+    return result["rect"], 0, result.get("mode", "window")
 
 
 def do_capture(args):
@@ -730,16 +792,18 @@ def do_capture(args):
         x, y, w, h = args.rect
         rect = (x, y, x + w, y + h)
         margin = args.margin
+        sel_mode = "window"
     elif getattr(args, "auto", False):
         mon = mss.MSS().monitors[0]
         rect = (mon["left"], mon["top"],
                 mon["left"] + mon["width"], mon["top"] + mon["height"])
         margin = args.margin
+        sel_mode = "window"
     elif getattr(args, "interactive", False) or True:
         # 直接在本进程内跑 tkinter 蒙层（pythonw 下可正常工作）
         # 不再启动子进程，避免启动开销导致慢
         mon = monitor_containing(*cursor_pos())
-        rect, margin = select_region(mon)
+        rect, margin, sel_mode = select_region(mon)
         if not rect:
             print("已取消。")
             return None
@@ -753,24 +817,35 @@ def do_capture(args):
     img = Image.frombytes("RGB", (r - l, b - t), img.rgb)
 
     rgb = np.asarray(img)
-    # 用颜色识别窗口顶部栏的下边界（去掉标题栏/工具栏）
-    top_cut = find_toolbar_bottom(np.asarray(img).astype(np.float32))
-    _log("顶部栏下边界: y=%s (窗口高 %s)" % (top_cut, img.height))
 
-    # 用方差法找内容边界（比颜色距离法更稳：照片里有白色衣服也不受影响）
-    x0, y0, x1, y1 = find_content_by_variance(rgb, threshold=args.threshold)
-    # 顶部栏下边界优先（top_cut 识别成功时强制用它）
-    if top_cut > 0:
-        y0 = top_cut
-    _log("裁剪区域: (%s,%s)-(%s,%s)" % (x0, y0, x1, y1))
-    # 向外扩大 margin，避免边缘像素被漏掉
-    x0 = max(0, x0 - args.margin)
-    y0 = max(0, y0 - args.margin)
-    x1 = min(img.width, x1 + args.margin)
-    y1 = min(img.height, y1 + args.margin)
+    if sel_mode == "drag":
+        # 拖拽模式：用户已精确指定区域，直接用原图，不再做边缘识别
+        x0, y0, x1, y1 = 0, 0, img.width, img.height
+        _log("拖拽模式: 使用原始矩形 %sx%s" % (img.width, img.height))
+    else:
+        # 窗口模式：识别顶部栏 + 内容边缘
+        top_cut = find_toolbar_bottom(np.asarray(img).astype(np.float32))
+        _log("顶部栏下边界: y=%s (窗口高 %s)" % (top_cut, img.height))
+
+        # 用方差法找内容边界（比颜色距离法更稳：照片里有白色衣服也不受影响）
+        x0, y0, x1, y1 = find_content_by_variance(rgb, threshold=args.threshold)
+        # 顶部栏下边界优先（top_cut 识别成功时强制用它）
+        if top_cut > 0:
+            y0 = top_cut
+        _log("裁剪区域: (%s,%s)-(%s,%s)" % (x0, y0, x1, y1))
+        # 向外扩大 margin，避免边缘像素被漏掉
+        x0 = max(0, x0 - args.margin)
+        y0 = max(0, y0 - args.margin)
+        x1 = min(img.width, x1 + args.margin)
+        y1 = min(img.height, y1 + args.margin)
 
     rgb_out = img.crop((x0, y0, x1, y1))
-    rgba_out = transparent_background(img, background_color(np.asarray(img)), args.threshold).crop((x0, y0, x1, y1))
+    if sel_mode == "drag":
+        # 拖拽模式：保留原始像素（不做透明化），用户已明确指定范围
+        rgba_out = rgb_out.convert("RGBA")
+    else:
+        rgba_out = transparent_background(
+            img, background_color(np.asarray(img)), args.threshold).crop((x0, y0, x1, y1))
 
     out = rgba_out if args.transparent else rgb_out
     copy_to_clipboard(out)
