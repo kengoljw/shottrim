@@ -16,51 +16,6 @@ import sys
 import time
 import winreg
 
-# 窗口列表缓存，避免每次按 Alt+Q 都重新枚举所有窗口（导致慢）
-_win_cache = None
-_win_cache_time = 0.0
-_win_rects_cache = []
-
-def _refresh_window_list():
-    global _win_cache, _win_cache_time, _win_rects_cache
-    now = time.time()
-    if _win_cache is not None and now - _win_cache_time < 1.0:
-        return _win_rects_cache
-    rects = []
-    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-
-    def rect_of(hwnd):
-        r = wintypes.RECT()
-        if dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)) != 0:
-            user32.GetWindowRect(hwnd, ctypes.byref(r))
-        return (r.left, r.top, r.right, r.bottom)
-
-    def cb(hwnd, lparam):
-        if not user32.IsWindowVisible(hwnd):
-            return True
-        if user32.IsIconic(hwnd):
-            return True
-        GWL_EXSTYLE = -20
-        WS_EX_TOOLWINDOW = 0x00000080
-        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        if ex & WS_EX_TOOLWINDOW:
-            return True
-        cls = ctypes.create_unicode_buffer(64)
-        user32.GetClassNameW(hwnd, cls, 64)
-        if cls.value in ("Progman", "WorkerW", "Shell_TrayWnd",
-                         "Windows.UI.Core.CoreWindow", "ForegroundStaging"):
-            return True
-        r = rect_of(hwnd)
-        w, h = r[2] - r[0], r[3] - r[1]
-        if w < 60 or h < 60:
-            return True
-        rects.append(r)
-        return True
-
-    user32.EnumWindows(WNDENUMPROC(cb), 0)
-    _win_rects_cache = rects
-    _win_cache_time = now
-    return _win_rects_cache
 from ctypes import wintypes
 
 import numpy as np
@@ -92,6 +47,7 @@ user32.GetAncestor.restype = ctypes.c_void_p
 user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.RECT)]
 user32.GetWindowRect.restype = ctypes.c_int
 user32.GetForegroundWindow.restype = ctypes.c_void_p
+user32.GetShellWindow.restype = ctypes.c_void_p
 user32.GetClientRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.RECT)]
 user32.GetClientRect.restype = ctypes.c_int
 user32.ClientToScreen.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.POINT)]
@@ -126,6 +82,10 @@ user32.OpenClipboard.restype = ctypes.c_int
 user32.EmptyClipboard.restype = ctypes.c_int
 user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
 user32.SetClipboardData.restype = ctypes.c_void_p
+user32.RegisterClipboardFormatW.argtypes = [ctypes.c_wchar_p]
+user32.RegisterClipboardFormatW.restype = ctypes.c_uint
+user32.GetClipboardData.restype = ctypes.c_void_p
+user32.GetClipboardData.argtypes = [ctypes.c_uint]
 user32.CloseClipboard.restype = ctypes.c_int
 
 WM_HOTKEY = 0x0312
@@ -192,70 +152,27 @@ def monitor_containing(x, y):
     return mss.MSS().monitors[1]
 
 
-def enumerate_window_rects():
-    """枚举当前所有可见、非最小化、有面积的顶层窗口矩形。
-    必须在创建全屏蒙层之前调用，否则蒙层会盖住一切。
-    结果缓存 1 秒，避免重复枚举导致卡顿。
+def get_foreground_window_rect():
+    """取当前最前（前台）窗口的矩形（虚拟屏幕坐标）。
+
+    优先用 DWM 的扩展边界（不含系统阴影），失败则退回 GetWindowRect。
+    如果取到的是桌面/全屏窗口，返回 None。
     """
-    global _win_cache, _win_cache_time, _win_rects_cache
-    now = time.time()
-    if _win_cache is not None and now - _win_cache_time < 1.0:
-        return _win_rects_cache
-    rects = []
-    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-
-    def rect_of(hwnd):
-        r = wintypes.RECT()
-        if dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)) != 0:
-            user32.GetWindowRect(hwnd, ctypes.byref(r))
-        return (r.left, r.top, r.right, r.bottom)
-
-    def cb(hwnd, lparam):
-        if not user32.IsWindowVisible(hwnd):
-            return True
-        if user32.IsIconic(hwnd):  # 最小化
-            return True
-        # 跳过工具窗口（托盘、输入法等）
-        GWL_EXSTYLE = -20
-        WS_EX_TOOLWINDOW = 0x00000080
-        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        if ex & WS_EX_TOOLWINDOW:
-            return True
-        cls = ctypes.create_unicode_buffer(64)
-        user32.GetClassNameW(hwnd, cls, 64)
-        if cls.value in ("Progman", "WorkerW", "Shell_TrayWnd",
-                         "Windows.UI.Core.CoreWindow", "ForegroundStaging"):
-            return True
-        r = rect_of(hwnd)
-        w, h = r[2] - r[0], r[3] - r[1]
-        if w < 60 or h < 60:
-            return True
-        rects.append(r)
-        return True
-
-    user32.EnumWindows(WNDENUMPROC(cb), 0)
-    _win_rects_cache = rects
-    _win_cache_time = now
-    return _win_rects_cache
-
-
-
-def pick_window_from_list(rects, sx, sy):
-    """从预枚举的窗口列表中，找包含鼠标且尺寸合理的窗口。"""
-    v = mss.MSS().monitors[0]
-    screen_area = v["width"] * v["height"]
-    best = None
-    best_area = None
-    for r in rects:
-        w, h = r[2] - r[0], r[3] - r[1]
-        if w * h > screen_area * 0.95: continue  # 排除桌面
-        if w < 100 or h < 100: continue          # 排除太小控件
-        if r[0] <= sx < r[2] and r[1] <= sy < r[3]:
-            area = w * h
-            if best_area is None or area < best_area:
-                best_area = area
-                best = r
-    return best
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    rect = wintypes.RECT()
+    if dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(rect),
+                                  ctypes.sizeof(rect)) != 0:
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    w, h = rect.right - rect.left, rect.bottom - rect.top
+    if w < 60 or h < 60:
+        return None
+    # 排除桌面窗口本身（GetShellWindow 返回的就是桌面）
+    shell = user32.GetShellWindow()
+    if shell and hwnd == shell:
+        return None
+    return (rect.left, rect.top, rect.right, rect.bottom)
 
 
 def get_window_under_cursor(sx, sy):
@@ -457,6 +374,45 @@ def auto_inset_to_content(img_np, win_l, win_t, win_r, win_b):
     return 0
 
 
+def find_toolbar_bottom(img_np, max_scan=120, min_change=10, skip=3):
+    """用颜色识别窗口顶部栏的下边界（不用固定高度）。
+
+    原理：
+    1. 逐行统计"与上一行颜色明显不同的列数"
+       —— 顶部栏是横向色带，到下边界时整行大面积换色，变化列数飙升
+       —— 栏内的图标/文字只影响少数列，不会造成大面积跳变
+    2. 找到变化列数的峰值，取"达到峰值 80% 的第一行"
+       —— 这样能正确处理紧邻的多条分隔线（取最上面那条）
+    3. skip 跳过窗口边框线所在的顶部几行
+
+    返回内容区起始的 y 坐标，识别失败返回 0。
+    """
+    h, w = img_np.shape[:2]
+    if h < 20:
+        return 0
+    arr = img_np.astype(np.int32)
+    limit = min(max_scan, h)
+
+    changes = np.zeros(limit, dtype=int)
+    for y in range(1, limit):
+        d = np.abs(arr[y] - arr[y - 1]).sum(axis=1)
+        changes[y] = int(np.count_nonzero(d > min_change))
+
+    start = min(skip + 1, limit - 1)
+    if start >= limit:
+        return 0
+    peak = int(changes[start:].max())
+    # 峰值太小说明没有明确的横向分界
+    if peak < w * 0.15:
+        return 0
+    thr = peak * 0.8
+    for y in range(start, limit):
+        if changes[y] >= thr:
+            return int(y)
+    return 0
+
+
+
 def find_content_by_variance(img_np, threshold=12):
     """用行/列颜色方差找内容边界（比颜色距离法更稳）。
 
@@ -556,59 +512,85 @@ def transparent_background(img, bg, threshold):
 
 
 def copy_to_clipboard(img):
-    """把图像写入剪贴板（CF_DIB, 32bpp BI_BITFIELDS, 带 alpha 掩码）。
-    同时保存一份 PNG 到桌面，返回文件路径。
+    """把图像写入剪贴板。
+
+    同时写入两种格式，保证到处都能粘贴：
+    - PNG 注册格式：浏览器（Chrome/Edge/OpenWebUI/微信）粘贴图片用这个
+    - CF_DIB：原生 Windows 应用（Office/画图/资源管理器）用这个
+    - CF_BITMAP：部分老程序用这个
+
+    PNG 格式保留 alpha 透明通道，浏览器粘贴时背景透明效果正确。
     """
+    import io as _io
     if img.mode != "RGBA":
         img = img.convert("RGBA")
     w, h = img.size
+
+    # ---------- 1. PNG 字节（浏览器用） ----------
+    png_buf = _io.BytesIO()
+    img.save(png_buf, format="PNG")
+    png_data = png_buf.getvalue()
+
+    # ---------- 2. CF_DIB 字节（原生应用用） ----------
     src = np.asarray(img)
-
-    # RGBA -> BGRA
     bgra = np.empty_like(src)
-    bgra[:, :, 0] = src[:, :, 2]
-    bgra[:, :, 1] = src[:, :, 1]
-    bgra[:, :, 2] = src[:, :, 0]
-    bgra[:, :, 3] = src[:, :, 3]
-
+    bgra[:, :, 0] = src[:, :, 2]   # B
+    bgra[:, :, 1] = src[:, :, 1]   # G
+    bgra[:, :, 2] = src[:, :, 0]   # R
+    bgra[:, :, 3] = src[:, :, 3]   # A
     row_stride = ((w * 4 + 3) // 4) * 4
     buf = np.zeros((h, row_stride), dtype=np.uint8)
     buf[:, : w * 4] = bgra.reshape(h, -1)
     buf = np.ascontiguousarray(buf[::-1])   # DIB 自底向上
-    data = buf.tobytes()
+    dib_data = buf.tobytes()
 
-    # BITMAPV4HEADER (108 bytes)
-    hdr = struct.pack("<IiiHHIIiiII", 108, w, h, 1, 32, 3, len(data), 0, 0, 0, 0)
+    # BITMAPV4HEADER (108 bytes) + BI_BITFIELDS 四掩码
+    hdr = struct.pack("<IiiHHIIiiII", 108, w, h, 1, 32, 3, len(dib_data), 0, 0, 0, 0)
     hdr += struct.pack("<IIII", 0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000)
-    hdr += struct.pack("<I", 0x57696E20)          # LCS_WINDOWS_COLOR_SPACE
-    hdr += struct.pack("<9i", 0, 0, 0, 0, 0, 0, 0, 0, 0)   # CIEXYZTRIPLE
-    hdr += struct.pack("<III", 0, 0, 0)            # Gamma
+    hdr += struct.pack("<I", 0x57696E20)                      # LCS_WINDOWS_COLOR_SPACE
+    hdr += struct.pack("<9i", 0, 0, 0, 0, 0, 0, 0, 0, 0)     # CIEXYZTRIPLE
+    hdr += struct.pack("<III", 0, 0, 0)                        # Gamma
     assert len(hdr) == 108, len(hdr)
 
-    total = len(hdr) + len(data)
     GMEM_MOVEABLE = 0x0002
     CF_DIB = 8
-    hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE, total)
-    if not hmem:
-        raise RuntimeError("GlobalAlloc failed")
-    pmem = kernel32.GlobalLock(hmem)
-    if not pmem:
-        raise RuntimeError("GlobalLock failed")
-    ctypes.memmove(pmem, hdr, len(hdr))
-    ctypes.memmove(pmem + len(hdr), data, len(data))
-    kernel32.GlobalUnlock(hmem)
+    CF_BITMAP = 2
+
+    # 注册 PNG / HTML 剪贴板格式
+    fmt_png = user32.RegisterClipboardFormatW("PNG")
+    fmt_html = user32.RegisterClipboardFormatW("HTML Format")
+
+    # ---------- 分配内存并写入 ----------
+    def alloc_copy(data):
+        hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+        if not hmem:
+            raise RuntimeError("GlobalAlloc failed")
+        pmem = kernel32.GlobalLock(hmem)
+        if not pmem:
+            raise RuntimeError("GlobalLock failed")
+        ctypes.memmove(pmem, data, len(data))
+        kernel32.GlobalUnlock(hmem)
+        return hmem
+
+    hmem_dib = alloc_copy(hdr + dib_data)
+    hmem_png = alloc_copy(png_data) if fmt_png else None
 
     if not user32.OpenClipboard(0):
-        kernel32.GlobalFree(hmem)
         raise RuntimeError("OpenClipboard failed")
     try:
         user32.EmptyClipboard()
-        if not user32.SetClipboardData(CF_DIB, hmem):
-            raise RuntimeError("SetClipboardData failed")
+        # PNG（浏览器粘贴图片）
+        if hmem_png and fmt_png:
+            if not user32.SetClipboardData(fmt_png, hmem_png):
+                raise RuntimeError("SetClipboardData(PNG) failed")
+        # CF_DIB（原生应用）
+        if not user32.SetClipboardData(CF_DIB, hmem_dib):
+            raise RuntimeError("SetClipboardData(CF_DIB) failed")
     finally:
         user32.CloseClipboard()
 
-    print(f"已复制到剪贴板 ({w} x {h})")
+    print(f"已复制到剪贴板 ({w} x {h})  [PNG + DIB]")
+
 
 
 def select_region(mon):
@@ -626,9 +608,10 @@ def select_region(mon):
     mw, mh = mon["width"], mon["height"]
     log2(f"select_region 开始: 显示器 {mw}x{mh}")
 
-    # 关键：必须在创建全屏蒙层之前枚举，否则蒙层会盖住所有窗口
-    win_rects = enumerate_window_rects()
-    log2(f"枚举到 {len(win_rects)} 个窗口: {win_rects}")
+    # 关键：必须在创建全屏蒙层之前取前台窗口
+    # （创建后前台窗口会变成蒙层自己）
+    fg = get_foreground_window_rect()
+    log2(f"前台窗口矩形: {fg}")
 
     root = tk.Tk()
     root.overrideredirect(True)
@@ -644,6 +627,15 @@ def select_region(mon):
     state = {"box": None, "win": None, "inset": 0, "hover": None}
     result = {"rect": None, "cancelled": False}
     last_cursor = {"x": mw // 2, "y": mh // 2}
+
+    # 初始选框 = 前台窗口
+    if fg:
+        _c = (max(0, fg[0] - ml), max(0, fg[1] - mt),
+              min(mw, fg[2] - ml), min(mh, fg[3] - mt))
+        if _c[2] - _c[0] > 40 and _c[3] - _c[1] > 40:
+            state["win"] = _c
+            state["hover"] = _c
+            state["box"] = _c
 
     def to_screen(cx, cy):
         return cx + ml, cy + mt
@@ -674,31 +666,12 @@ def select_region(mon):
                 canvas.create_text(x0 + 6, max(y0 - 14, 12), anchor="w", fill="#00e0ff",
                                  font=("Consolas", 11), text=f"{x1-x0} x {y1-y0}")
             canvas.create_text(mw // 2, 30,
-                             text="移动鼠标自动吸附窗口  |  单击确认  |  Esc取消",
+                             text="已识别当前最前窗口  |  单击确认  |  ↑↓ 收缩  |  Esc取消",
                              fill="white", font=("Microsoft YaHei", 13))
 
     def on_motion(e):
+        # 只跟踪鼠标位置用于十字准星，选框固定为前台窗口
         last_cursor["x"], last_cursor["y"] = e.x, e.y
-        # 实时找包含鼠标的最小窗口
-        best = pick_window_from_list(win_rects, e.x + ml, e.y + mt)
-        if best:
-            log2(f"鼠标({e.x+ml},{e.y+mt}) 命中窗口 {best} = {best[2]-best[0]}x{best[3]-best[1]}")
-        if best:
-            c = screen_rect_to_canvas(best)
-            if c[2] - c[0] > 40 and c[3] - c[1] > 40:
-                state["hover"] = c
-                if not state["box"]:
-                    state["box"] = None
-                # 悬停时就把当前候选作为框（未锁定）
-                state["win"] = c
-                state["inset"] = 0
-                state["box"] = c
-            else:
-                state["hover"] = None
-                state["box"] = None
-        else:
-            state["hover"] = None
-            state["box"] = None
         redraw()
 
     def apply_inset(delta):
@@ -718,11 +691,8 @@ def select_region(mon):
         cx, cy = e.x, e.y
         last_cursor["x"], last_cursor["y"] = cx, cy
         log2(f"单击 at ({cx+ml},{cy+mt}) 当前box={state['box']}")
-        # 单击即确认当前吸附的窗口（悬停时已实时更新）
         if not state["box"]:
-            best = pick_window_from_list(win_rects, cx + ml, cy + mt)
-            if best:
-                state["box"] = screen_rect_to_canvas(best)
+            log2("当前没有选框，忽略")
         if state["box"]:
             x0, y0, x1, y1 = state["box"]
             sl, st = to_screen(x0, y0)
@@ -745,6 +715,14 @@ def select_region(mon):
 
 
 def do_capture(args):
+    _LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shottrim.log")
+    def _log(msg):
+        try:
+            with open(_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(time.strftime("[%H:%M:%S] ") + str(msg) + chr(10))
+        except Exception:
+            pass
+
     if getattr(args, "delay", 0) and args.delay > 0:
         time.sleep(args.delay)
 
@@ -775,8 +753,16 @@ def do_capture(args):
     img = Image.frombytes("RGB", (r - l, b - t), img.rgb)
 
     rgb = np.asarray(img)
+    # 用颜色识别窗口顶部栏的下边界（去掉标题栏/工具栏）
+    top_cut = find_toolbar_bottom(np.asarray(img).astype(np.float32))
+    _log("顶部栏下边界: y=%s (窗口高 %s)" % (top_cut, img.height))
+
     # 用方差法找内容边界（比颜色距离法更稳：照片里有白色衣服也不受影响）
     x0, y0, x1, y1 = find_content_by_variance(rgb, threshold=args.threshold)
+    # 顶部栏下边界优先（top_cut 识别成功时强制用它）
+    if top_cut > 0:
+        y0 = top_cut
+    _log("裁剪区域: (%s,%s)-(%s,%s)" % (x0, y0, x1, y1))
     # 向外扩大 margin，避免边缘像素被漏掉
     x0 = max(0, x0 - args.margin)
     y0 = max(0, y0 - args.margin)
