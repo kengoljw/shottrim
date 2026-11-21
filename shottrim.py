@@ -374,87 +374,184 @@ def auto_inset_to_content(img_np, win_l, win_t, win_r, win_b):
     return 0
 
 
-def find_toolbar_bottom(img_np, max_scan=120, min_change=10, skip=3):
+def trim_window_frame(arr, max_trim=12, col_thresh=25, row_thresh=12):
+    """去掉窗口截图四边的边框/阴影，返回 (x0, y0, x1, y1)。
+
+    逐边扫描：比较相邻行/列的平均色，找到内容真正开始的位置。
+    边框通常只有几像素，且颜色与内容差异明显。
+    """
+    h, w = arr.shape[:2]
+    if h < 20 or w < 20:
+        return (0, 0, w, h)
+    a = arr.astype(np.float64)
+
+    # ---- 左边界 ----
+    x0 = 0
+    col0 = a[:, 0].mean(axis=0)
+    for x in range(1, min(max_trim, w - 1)):
+        col = a[:, x].mean(axis=0)
+        if np.abs(col - col0).sum() > col_thresh:
+            # 再确认后续列保持稳定（避免停在渐变中）
+            if x + 1 < w - 1:
+                col_next = a[:, x + 1].mean(axis=0)
+                if np.abs(col_next - col).sum() < col_thresh * 2:
+                    x0 = x
+                    break
+            else:
+                x0 = x
+                break
+
+    # ---- 右边界 ----
+    x1 = w
+    col_last = a[:, w - 1].mean(axis=0)
+    for d in range(1, min(max_trim, w - 1)):
+        x = w - 1 - d
+        col = a[:, x].mean(axis=0)
+        if np.abs(col - col_last).sum() > col_thresh:
+            if x - 1 >= 0:
+                col_prev = a[:, x - 1].mean(axis=0)
+                if np.abs(col_prev - col).sum() < col_thresh * 2:
+                    x1 = x + 1
+                    break
+            else:
+                x1 = x + 1
+                break
+
+    # ---- 上边界 ----
+    y0 = 0
+    row0 = a[0].mean(axis=0)
+    for y in range(1, min(max_trim, h - 1)):
+        row = a[y].mean(axis=0)
+        if np.abs(row - row0).sum() > row_thresh:
+            y0 = y
+            break
+
+    # ---- 下边界 ----
+    y1 = h
+    row_last = a[h - 1].mean(axis=0)
+    for d in range(1, min(max_trim, h - 1)):
+        y = h - 1 - d
+        row = a[y].mean(axis=0)
+        if np.abs(row - row_last).sum() > row_thresh:
+            y1 = y + 1
+            break
+
+    if x1 - x0 < 20 or y1 - y0 < 20:
+        return (0, 0, w, h)
+    return (int(x0), int(y0), int(x1), int(y1))
+
+
+def find_toolbar_bottom(img_np, max_scan=150, mode_thresh=12,
+                        content_ratio=0.35, stable_rows=8):
     """用颜色识别窗口顶部栏的下边界（不用固定高度）。
 
     原理：
-    1. 逐行统计"与上一行颜色明显不同的列数"
-       —— 顶部栏是横向色带，到下边界时整行大面积换色，变化列数飙升
-       —— 栏内的图标/文字只影响少数列，不会造成大面积跳变
-    2. 找到变化列数的峰值，取"达到峰值 80% 的第一行"
-       —— 这样能正确处理紧邻的多条分隔线（取最上面那条）
-    3. skip 跳过窗口边框线所在的顶部几行
+    1. 逐行求众数色，找"众数色发生变化"的行 → 这些是候选边界
+       （顶部栏是均匀色带，内容区众数色不同）
+    2. 对每个候选，检查下方内容区：
+       - 内容占比：与背景色明显不同的像素比例
+       - 稳定性：连续 stable_rows 行的占比都够高
+    3. 选第一个满足条件的候选
 
     返回内容区起始的 y 坐标，识别失败返回 0。
     """
     h, w = img_np.shape[:2]
-    if h < 20:
+    if h < stable_rows + 20:
         return 0
     arr = img_np.astype(np.int32)
     limit = min(max_scan, h)
 
-    changes = np.zeros(limit, dtype=int)
-    for y in range(1, limit):
-        d = np.abs(arr[y] - arr[y - 1]).sum(axis=1)
-        changes[y] = int(np.count_nonzero(d > min_change))
+    # 逐行众数色
+    modes = np.zeros((limit, 3), dtype=np.float32)
+    for y in range(limit):
+        row = arr[y]
+        q = row // 8
+        keys = (q[:, 0].astype(np.int64) * 4096
+                + q[:, 1].astype(np.int64) * 64
+                + q[:, 2].astype(np.int64))
+        vals, counts = np.unique(keys, return_counts=True)
+        modes[y] = np.median(row[keys == vals[np.argmax(counts)]], axis=0)
 
-    start = min(skip + 1, limit - 1)
-    if start >= limit:
+    # 候选：众数色相对基准发生变化的行
+    base = modes[0]
+    candidates = []
+    for y in range(1, limit):
+        if np.abs(modes[y] - base).sum() > mode_thresh:
+            candidates.append(y)
+
+    if not candidates:
         return 0
-    peak = int(changes[start:].max())
-    # 峰值太小说明没有明确的横向分界
-    if peak < w * 0.15:
-        return 0
-    thr = peak * 0.8
-    for y in range(start, limit):
-        if changes[y] >= thr:
+
+    # 背景色（用于算内容占比）：取基准行的众数色
+    bg = base.astype(np.float32)
+
+    # 每行与背景色不同的像素占比
+    ratios = np.zeros(limit, dtype=np.float64)
+    for y in range(limit):
+        d = np.abs(arr[y].astype(np.float32) - bg).sum(axis=1)
+        ratios[y] = np.count_nonzero(d > 25) / w
+
+    # 选第一个"下方内容占比高且稳定"的候选
+    for y in candidates:
+        if y + stable_rows >= limit:
+            continue
+        window = ratios[y:y + stable_rows]
+        if np.count_nonzero(window > content_ratio) >= stable_rows - 1:
             return int(y)
-    return 0
+
+    # 都没满足，返回第一个候选（宁可多切也不要留工具栏）
+    return int(candidates[0])
 
 
 
 def find_content_by_variance(img_np, threshold=12):
-    """用行/列颜色方差找内容边界（比颜色距离法更稳）。
+    """用自适应阈值的逐列/逐行标准差找内容边界。
 
     原理：
-    - 纯色背景行/列：颜色变化范围 ≈ 0
-    - 内容行/列：颜色变化范围大（有照片、有边框）
-    - 找最长连续内容行/列，自动排除工具栏等碎片
+    - 纯色留白行/列：标准差很小（几乎没有颜色变化）
+    - 内容行/列：标准差明显大（有照片、边框、文字）
+    - 阈值取"全部列/行标准差中位数"的一定比例，自适应不同内容
+    - 从左右两侧向内扫描，跳过连续的低标准差区域
+
     优点：
-    - 不依赖背景色具体值（白色/灰色/黑色背景都能用）
-    - 照片内有白色衣服也不怕（因为看的是变化幅度，不是绝对值）
+    - 不依赖背景色具体值
+    - 浅色深色背景都适用
+    - 照片内有白色衣服也不怕（看的是变化幅度）
     """
     h, w = img_np.shape[:2]
-    gray = np.mean(img_np, axis=2).astype(np.float32)
+    if h < 20 or w < 20:
+        return (0, 0, w, h)
 
-    row_range = np.max(gray, axis=1) - np.min(gray, axis=1)
-    col_range = np.max(gray, axis=0) - np.min(gray, axis=0)
+    gray = np.mean(img_np.astype(np.float32), axis=2)
+    col_std = gray.std(axis=0)
+    row_std = gray.std(axis=1)
 
-    def longest_run(mask):
-        best_start, best_len = 0, 0
-        cur_start, cur_len = 0, 0
-        for i, v in enumerate(mask):
-            if v:
-                if cur_len == 0:
-                    cur_start = i
-                cur_len += 1
-                if cur_len > best_len:
-                    best_len = cur_len
-                    best_start = cur_start
-            else:
-                cur_len = 0
-        return best_start, best_start + best_len
+    # 自适应阈值：取中位数的一定比例（至少 threshold）
+    col_thr = max(threshold, float(np.median(col_std)) * 0.35)
+    row_thr = max(threshold, float(np.median(row_std)) * 0.35)
 
-    content_rows = row_range > threshold
-    content_cols = col_range > threshold
+    def scan(arr, thr, limit=None):
+        """从两端向内扫描，返回内容段的起止。"""
+        n = len(arr)
+        if limit is None:
+            limit = n
+        # 左边：跳过连续的低值区
+        lo = 0
+        while lo < limit and arr[lo] <= thr:
+            lo += 1
+        # 右边
+        hi = n - 1
+        while hi >= 0 and arr[hi] <= thr:
+            hi -= 1
+        return lo, hi + 1
 
-    y0, y1 = longest_run(content_rows)
-    x0, x1 = longest_run(content_cols)
+    x0, x1 = scan(col_std, col_thr)
+    y0, y1 = scan(row_std, row_thr)
 
-    if y1 - y0 < 10 or x1 - x0 < 10:
-        # 方差法失效，退回全图
+    if x1 - x0 < 10 or y1 - y0 < 10:
         return (0, 0, w, h)
     return (int(x0), int(y0), int(x1), int(y1))
+
 
 
 def background_color(rgb):
@@ -823,8 +920,15 @@ def do_capture(args):
         x0, y0, x1, y1 = 0, 0, img.width, img.height
         _log("拖拽模式: 使用原始矩形 %sx%s" % (img.width, img.height))
     else:
-        # 窗口模式：识别顶部栏 + 内容边缘
-        top_cut = find_toolbar_bottom(np.asarray(img).astype(np.float32))
+        # 窗口模式：先去边框，再识别顶部栏 + 内容边缘
+        fx0, fy0, fx1, fy1 = trim_window_frame(rgb)
+        _log("去边框: (%s,%s)-(%s,%s) (原 %sx%s)" % (
+            fx0, fy0, fx1, fy1, img.width, img.height))
+        img = img.crop((fx0, fy0, fx1, fy1))
+        rgb = np.asarray(img)
+
+        # 用颜色识别窗口顶部栏的下边界（去掉标题栏/工具栏）
+        top_cut = find_toolbar_bottom(rgb.astype(np.float32))
         _log("顶部栏下边界: y=%s (窗口高 %s)" % (top_cut, img.height))
 
         # 用方差法找内容边界（比颜色距离法更稳：照片里有白色衣服也不受影响）
